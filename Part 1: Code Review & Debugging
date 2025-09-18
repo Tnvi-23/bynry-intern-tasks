@@ -1,4 +1,6 @@
 #part 1:
+Task 1:Correct code:
+
 from flask import request, jsonify
 from models import db, Product, Inventory
 from sqlalchemy.exc import SQLAlchemyError
@@ -50,7 +52,7 @@ def create_product():
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
 
-#Issues Identified:
+Task 2: Issues Identified:
 
 1. No Input Validation
 - Problem: Assumes all required fields are present and correctly typed.
