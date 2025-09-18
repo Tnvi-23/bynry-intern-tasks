@@ -1,3 +1,4 @@
+#part 1:
 from flask import request, jsonify
 from models import db, Product, Inventory
 from sqlalchemy.exc import SQLAlchemyError
@@ -80,4 +81,184 @@ def create_product():
 - Problem: Returns plain dict without HTTP status.
 - Impact: Clients can't distinguish success from failure reliably.
 - Fix: Use jsonify() with proper status codes.
+
+# Part 2:
+
+-- Companies
+CREATE TABLE companies (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE
+);
+
+-- Warehouses (linked to companies)
+CREATE TABLE warehouses (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    company_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    location TEXT,
+    FOREIGN KEY (company_id) REFERENCES companies(id)
+);
+
+-- Suppliers
+CREATE TABLE suppliers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    contact_info TEXT
+);
+
+-- Products
+CREATE TABLE products (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    sku TEXT UNIQUE NOT NULL,
+    price REAL NOT NULL,
+    supplier_id INTEGER,
+    is_bundle BOOLEAN DEFAULT FALSE,
+    FOREIGN KEY (supplier_id) REFERENCES suppliers(id)
+);
+
+-- Product Bundles (many-to-many self-reference)
+CREATE TABLE product_bundle_items (
+    bundle_id INTEGER NOT NULL,
+    item_id INTEGER NOT NULL,
+    quantity INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (bundle_id, item_id),
+    FOREIGN KEY (bundle_id) REFERENCES products(id),
+    FOREIGN KEY (item_id) REFERENCES products(id)
+);
+
+-- Inventory per warehouse
+CREATE TABLE inventory (
+    product_id INTEGER NOT NULL,
+    warehouse_id INTEGER NOT NULL,
+    quantity INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (product_id, warehouse_id),
+    FOREIGN KEY (product_id) REFERENCES products(id),
+    FOREIGN KEY (warehouse_id) REFERENCES warehouses(id)
+);
+
+-- Inventory change log
+CREATE TABLE inventory_changes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    product_id INTEGER NOT NULL,
+    warehouse_id INTEGER NOT NULL,
+    change_type TEXT CHECK (change_type IN ('IN', 'OUT', 'ADJUST')),
+    quantity_change INTEGER NOT NULL,
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+    reason TEXT,
+    FOREIGN KEY (product_id) REFERENCES products(id),
+    FOREIGN KEY (warehouse_id) REFERENCES warehouses(id)
+);
+
+Questions to Ask the Product Team
+- User Roles: Who manages inventory—admins, suppliers, warehouse staff? Do we need user accounts and permissions?
+- Bundle Behavior: Should bundles auto-update if a component’s inventory changes? Can bundles be nested?
+- Inventory Units: Are we tracking units, weight, volume? Is quantity always an integer?
+- Change Reasons: Should reasons be standardized (e.g., damaged, sold, returned)? Do we need a separate table?
+- Supplier Relationships: Can multiple suppliers provide the same product? Is there pricing per supplier?
+- Warehouse Capacity: Do warehouses have max capacity or constraints?
+- Product Lifecycle: Do we track product expiration, batch numbers, or manufacturing dates?
+- Multi-company Access: Can suppliers or users belong to multiple companies?
+
+Design Decisions & Justifications 
+1 Indexes : Unique index on sku for fast lookup; composite PKs on inventory and bundle_items 
+2 Foreign Keys : Enforce referential integrity between companies, warehouses, products, suppliers 
+3 Bundle Modeling : Self-referencing many-to-many table allows flexible bundle composition 
+4 Inventory Log : Separate table tracks history without overwriting current quantity 
+5 Change Types : Enum-like constraint ensures consistent tracking (IN, OUT, ADJUST) 
+6 Scalability : Modular design allows future extension (e.g., batch tracking, multi-unit support)  
+7 Normalization : Avoids redundancy; each entity has its own table with clear relationships 
+
+#Part 3:
+Assumptions
+- Product Thresholds are stored in a product_thresholds table.
+- Sales Activity is tracked in a sales table with timestamps.
+- Inventory is stored per warehouse in an inventory table.
+- Suppliers are linked to products via supplier_id.
+- Stockout Estimation is based on average daily sales over the last 30 days.
+
+Flask endpoint implementation:
+
+from flask import Flask, jsonify
+from models import db, Company, Warehouse, Product, Inventory, Supplier, Sale, ProductThreshold
+from sqlalchemy import func
+from datetime import datetime, timedelta
+
+app = Flask(__name__)
+
+@app.route('/api/companies/<int:company_id>/alerts/low-stock', methods=['GET'])
+def low_stock_alerts(company_id):
+    alerts = []
+    today = datetime.utcnow()
+    thirty_days_ago = today - timedelta(days=30)
+
+    # Step 1: Get all warehouses for the company
+    warehouses = Warehouse.query.filter_by(company_id=company_id).all()
+
+    for warehouse in warehouses:
+        # Step 2: Get inventory for each warehouse
+        inventory_items = db.session.query(
+            Inventory.product_id,
+            Inventory.quantity,
+            Product.name,
+            Product.sku,
+            Product.supplier_id,
+            ProductThreshold.threshold
+        ).join(Product, Product.id == Inventory.product_id
+        ).join(ProductThreshold, Product.id == ProductThreshold.product_id
+        ).filter(Inventory.warehouse_id == warehouse.id).all()
+
+        for item in inventory_items:
+            product_id, quantity, name, sku, supplier_id, threshold = item
+
+            # Step 3: Check recent sales activity
+            recent_sales = db.session.query(func.sum(Sale.quantity)).filter(
+                Sale.product_id == product_id,
+                Sale.warehouse_id == warehouse.id,
+                Sale.timestamp >= thirty_days_ago
+            ).scalar() or 0
+
+            if recent_sales == 0:
+                continue  # Skip products with no recent sales
+
+            # Step 4: Estimate days until stockout
+            avg_daily_sales = recent_sales / 30
+            days_until_stockout = int(quantity / avg_daily_sales) if avg_daily_sales > 0 else None
+
+            if quantity < threshold:
+                # Step 5: Get supplier info
+                supplier = Supplier.query.get(supplier_id)
+
+                alerts.append({
+                    "product_id": product_id,
+                    "product_name": name,
+                    "sku": sku,
+                    "warehouse_id": warehouse.id,
+                    "warehouse_name": warehouse.name,
+                    "current_stock": quantity,
+                    "threshold": threshold,
+                    "days_until_stockout": days_until_stockout,
+                    "supplier": {
+                        "id": supplier.id,
+                        "name": supplier.name,
+                        "contact_email": supplier.contact_info  # assuming contact_info includes email
+                    }
+                })
+
+    return jsonify({
+        "alerts": alerts,
+        "total_alerts": len(alerts)
+    }), 200
+
+ Edge Cases Handled:
+1 No warehouses for company : Returns empty alert list 
+2 No recent sales : Skips product from alert 
+3 Zero daily sales : Avoids division by zero  
+4 Missing supplier info : Assumes supplier exists (can add fallback) 
+5 Missing threshold : Requires ProductThreshold join  
+
+
+
+
+
 
